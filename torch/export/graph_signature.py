@@ -56,13 +56,8 @@ class InputSpec:
     kind: InputKind
     arg: ArgumentSpec
     target: Optional[str]
-    persistent: Optional[bool] = None
 
     def __post_init__(self):
-        if self.kind == InputKind.BUFFER:
-            assert (
-                self.persistent is not None
-            ), "Failed to specify persistent flag on BUFFER."
         assert isinstance(
             self.arg,
             (TensorArgument, SymIntArgument, ConstantArgument, CustomObjArgument),
@@ -116,14 +111,7 @@ def _sig_to_specs(
             )
         elif name in inputs_to_buffers:
             return InputSpec(
-                kind=InputKind.BUFFER,
-                arg=i,
-                target=inputs_to_buffers[name],
-                # Mark as True for now; we will fix this up to distinguish
-                # persistent from non-persistent later in tracing.
-                # See: rewrite_non_persistent_buffers()
-                # TODO(suo): this is horrible.
-                persistent=True,
+                kind=InputKind.BUFFER, arg=i, target=inputs_to_buffers[name]
             )
         else:
             raise AssertionError(f"Unknown tensor input kind: {name}")
@@ -278,16 +266,6 @@ class ExportGraphSignature:
             if isinstance(s.target, str)
         ]
 
-    @property
-    def non_persistent_buffers(self) -> Collection[str]:
-        return [
-            s.target
-            for s in self.input_specs
-            if s.kind == InputKind.BUFFER
-            if s.persistent is False
-            if isinstance(s.target, str)
-        ]
-
     # A list of lifted constant tensors
     @property
     def lifted_tensor_constants(self) -> Collection[str]:
@@ -311,21 +289,35 @@ class ExportGraphSignature:
 
     # Graph node names of pytree-flattened inputs of original program
     @property
-    def user_inputs(self) -> Collection[str]:
-        return tuple(
-            s.arg.name
-            for s in self.input_specs
-            if s.kind == InputKind.USER_INPUT and isinstance(s.arg, TensorArgument)
-        )
+    def user_inputs(self) -> Collection[Union[int, float, bool, None, str]]:
+        user_inputs: List[Union[int, float, bool, None, str]] = []
+        for s in self.input_specs:
+            if s.kind != InputKind.USER_INPUT:
+                continue
+
+            if isinstance(s.arg, (TensorArgument, SymIntArgument, CustomObjArgument)):
+                user_inputs.append(s.arg.name)
+            elif isinstance(s.arg, ConstantArgument):
+                user_inputs.append(s.arg.value)
+            else:
+                raise RuntimeError(f"{s.arg} is not a valid user inputs")
+        return tuple(user_inputs)
 
     # Graph node names of pytree-flattened outputs of original program
     @property
-    def user_outputs(self) -> Collection[str]:
-        return tuple(
-            s.arg.name
-            for s in self.output_specs
-            if s.kind == OutputKind.USER_OUTPUT and isinstance(s.arg, TensorArgument)
-        )
+    def user_outputs(self) -> Collection[Union[int, float, bool, None, str]]:
+        user_outputs: List[Union[int, float, bool, None, str]] = []
+        for s in self.output_specs:
+            if s.kind != OutputKind.USER_OUTPUT:
+                continue
+
+            if isinstance(s.arg, (TensorArgument, SymIntArgument)):
+                user_outputs.append(s.arg.name)
+            elif isinstance(s.arg, ConstantArgument):
+                user_outputs.append(s.arg.value)
+            else:
+                raise RuntimeError(f"{s.arg} is not a valid user output")
+        return tuple(user_outputs)
 
     # A dictionary mapping graph input node names to parameters. If a graph input
     # name is found in this dictionary, it is guranteed to be a lifted parameter.
@@ -344,7 +336,7 @@ class ExportGraphSignature:
     @property
     def inputs_to_buffers(self) -> Mapping[str, str]:
         return {
-            s.arg.name: s.target  # type: ignore[union-attr, misc]
+            s.arg.name: s.target
             for s in self.input_specs
             if s.kind == InputKind.BUFFER
             and isinstance(s.arg, TensorArgument)
